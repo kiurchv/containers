@@ -1,0 +1,189 @@
+name: Build container images
+
+on:
+  push:
+    branches:
+      - main
+
+concurrency:
+  group: "${{ github.event.pull_request.head.label || github.head_ref || github.ref }}"
+
+jobs:
+  prepare:
+    name: Prepare workflow data
+    runs-on: ubuntu-latest
+
+    outputs:
+      changed: ${{ steps.changed-files.outputs.all_changed_and_modified_files }}
+      changed-count: ${{ steps.changed-files.outputs.all_changed_and_modified_files_count }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - uses: tj-actions/changed-files@v45
+        id: changed-files
+        with:
+          dir_names: true
+          dir_names_exclude_current_dir: true
+          dir_names_max_depth: 1
+          files_ignore: |
+            .github
+          matrix: true
+
+  build:
+    name: Build image
+    needs: prepare
+    if: ${{ needs.prepare.outputs.changed-count > 0 }}
+
+    strategy:
+      matrix:
+        name: ${{ fromJSON(needs.prepare.outputs.changed) }}
+        platform:
+          - os: linux
+            arch: amd64
+            runner: ubuntu-24.04
+          - os: linux
+            arch: arm64
+            runner: ubuntu-24.04-arm
+
+    runs-on: ${{ matrix.platform.runner }}
+
+    steps:
+      - name: Install container tools
+        if: runner.arch == 'ARM64'
+        run: |
+          sudo apt-get install -y podman buildah skopeo
+          sudo mkdir -p /etc/containers
+          printf "[registries.search]\nregistries = ['docker.io', 'quay.io']\n" | sudo tee /etc/containers/registries.conf
+
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Cache podman storage
+        uses: actions/cache@v3
+        with:
+          path: ~/.local/share/containers/storage
+          key: podman-storage-${{ matrix.platform.os }}/${{ matrix.platform.arch }}
+
+      - name: Set lower case owner name
+        run: |
+          echo "OWNER_LC=${OWNER,,}" >> ${GITHUB_ENV}
+        env:
+          OWNER: "${{ github.repository_owner }}"
+
+      - name: Collect metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: |
+            ghcr.io/${{ env.OWNER_LC }}/${{ matrix.name }}
+          tags: |
+            type=raw,value=build
+          flavor: |
+            suffix=-${{ matrix.platform.os }}-${{ matrix.platform.arch }}
+
+      - name: Build image
+        id: build-image
+        uses: redhat-actions/buildah-build@v2
+        with:
+          platforms: ${{ matrix.platform.os }}/${{ matrix.platform.arch }}
+          # build-args: ???
+          context: ${{ matrix.name }}
+          containerfiles: |
+            ${{ matrix.name }}/Containerfile
+          image: ${{ matrix.name }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          layers: true
+          oci: true
+
+      - name: Copy image as OCI archive
+        run: |
+          podman save \
+            --format oci-archive \
+            -o /tmp/${{ matrix.name }}-${{ matrix.platform.os }}-${{ matrix.platform.arch }}-oci.tar \
+            ghcr.io/${{ env.OWNER_LC }}/${{ matrix.name }}:build-${{ matrix.platform.os }}-${{ matrix.platform.arch }}
+
+      - name: Upload OCI archive
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.name }}-build-${{ matrix.platform.os }}-${{ matrix.platform.arch }}
+          path: /tmp/${{ matrix.name }}-${{ matrix.platform.os }}-${{ matrix.platform.arch }}-oci.tar
+          if-no-files-found: error
+          retention-days: 1
+
+  upload:
+    name: Upload images
+    needs: [prepare, build]
+
+    strategy:
+      matrix:
+        name: ${{ fromJSON(needs.prepare.outputs.changed) }}
+
+    permissions:
+      contents: read
+      packages: write
+
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Download OCI archives
+        uses: actions/download-artifact@v4
+        with:
+          pattern: ${{ matrix.name }}-build-*
+          path: oci-archives
+          merge-multiple: true
+
+      - name: Set lower case owner name
+        run: |
+          echo "OWNER_LC=${OWNER,,}" >> ${GITHUB_ENV}
+        env:
+          OWNER: "${{ github.repository_owner }}"
+
+      - name: Create manifest
+        run: |
+          podman manifest create ghcr.io/${{ env.OWNER_LC }}/${{ matrix.name }}:manifest
+
+          for archive in ./oci-archives/*-oci.tar; do
+            podman manifest add ghcr.io/${{ env.OWNER_LC }}/${{ matrix.name }}:manifest oci-archive:$archive
+          done
+
+          podman manifest inspect ghcr.io/${{ env.OWNER_LC }}/${{ matrix.name }}:manifest
+
+      - name: Collect version number
+        id: version
+        run: |
+          VERSION=$(cat ${{ matrix.name }}/VERSION)
+          echo "value=${VERSION}" >> ${GITHUB_OUTPUT}
+
+      - name: Collect metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: |
+            ghcr.io/${{ env.OWNER_LC }}/${{ matrix.name }}
+          tags: |
+            type=semver,pattern={{version}},value=${{ steps.version.value }}
+            type=semver,pattern={{major}}.{{minor}},value=${{ steps.version.value }}
+            type=semver,pattern={{major}},value=${{ steps.version.value }}
+            type=ref,event=branch
+            type=ref,event=pr
+          flavor: |
+            latest=${{ github.ref_name == github.event.repository.default_branch }}
+
+      - name: Add tags
+        run: |
+          # fix multi-line issue from steps.meta.outputs.tags
+          podman tag ghcr.io/${{ env.OWNER_LC }}/${{ matrix.name }}:manifest $(echo "${{ steps.meta.outputs.tags }}" | tr '\n' ' ')
+
+      - name: Push image to GHCR
+        uses: redhat-actions/push-to-registry@v2
+        id: push
+        with:
+          tags: ${{ steps.meta.outputs.tags }}
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+
+      - name: Print image url
+        run: echo "Image pushed to ${{ steps.push.outputs.registry-paths }}"
