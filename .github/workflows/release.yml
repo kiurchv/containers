@@ -1,0 +1,208 @@
+name: Build container images
+
+on:
+  push:
+    branches:
+      - main
+
+concurrency:
+  group: "${{ github.event.pull_request.head.label || github.head_ref || github.ref }}"
+
+jobs:
+  prepare:
+    name: Prepare workflow data
+    runs-on: ubuntu-latest
+
+    outputs:
+      targets-count: ${{ steps.changed-dirs.outputs.all_changed_and_modified_files_count }}
+      targets: ${{ steps.collect-targets.outputs.targets }}
+      matrix: ${{ steps.collect-targets.outputs.matrix }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Check changed dirs
+        uses: tj-actions/changed-files@v45
+        id: changed-dirs
+        with:
+          dir_names: true
+          dir_names_exclude_current_dir: true
+          dir_names_max_depth: 1
+          files_ignore: |
+            .github
+
+      - name: Collect build targets
+        id: collect-targets
+        env:
+          CHANGED_DIRS: ${{ steps.changed-dirs.outputs.all_changed_and_modified_files }}
+        run: |
+          targets='{}'
+
+          for name in ${CHANGED_DIRS}; do
+            bake_out=$(docker buildx bake -f $name/docker-bake.hcl --print | jq '.target.default')
+            context=$(realpath --relative-to=. $name/$(echo "$bake_out" | jq -r '.context'))
+            dockerfile=$(realpath --relative-to=. $name/$(echo "$bake_out" | jq -r '.dockerfile'))
+            target=$(echo "$bake_out" | jq ". * {\"context\": \"$context\", \"dockerfile\": \"$dockerfile\"}")
+            targets=$(echo "$targets" | jq -c ". * {\"$name\": $target}")
+          done
+
+          echo "targets=${targets}" >> ${GITHUB_OUTPUT}
+
+          matrix=$(echo "$targets" | jq -c '[to_entries[] | .key as $key | [.value.platforms[] | {"name": $key, "platform": .}]] | flatten')
+          echo "matrix=${matrix}" >> ${GITHUB_OUTPUT}
+
+  build:
+    name: Build image
+    needs: prepare
+    if: ${{ needs.prepare.outputs.targets-count > 0 }}
+
+    strategy:
+      matrix:
+        include: ${{ fromJSON(needs.prepare.outputs.matrix) }}
+
+    runs-on: ${{ fromJSON(vars.PLATFORMS_RUNNERS)[matrix.platform] }}
+
+    steps:
+      - name: Install container tools
+        if: runner.os == 'Linux' && runner.arch == 'ARM64'
+        run: |
+          sudo apt-get install -y podman buildah skopeo
+          sudo mkdir -p /etc/containers
+          printf "[registries.search]\nregistries = ['docker.io', 'quay.io']\n" | sudo tee /etc/containers/registries.conf
+
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Cache podman storage
+        uses: actions/cache@v3
+        with:
+          path: ~/.local/share/containers/storage
+          key: podman-storage-${{ matrix.platform }}
+
+      - name: Transform context data
+        env:
+          TARGETS: ${{ needs.prepare.outputs.targets }}
+          PLATFORM: ${{ matrix.platform }}
+        run: |
+          TARGET=$(echo "$TARGETS" | jq -c '.["${{ matrix.name }}"]')
+          echo "TARGET=${TARGET}" >> ${GITHUB_ENV}
+
+          IMAGE_TAG=$(echo "$TARGET" | jq -r '.tags[0]')
+          echo "IMAGE_NAME=${IMAGE_TAG%:*}" >> ${GITHUB_ENV}
+          echo "IMAGE_VERSION=${IMAGE_TAG#*:}" >> ${GITHUB_ENV}
+
+          echo "BUILD_ARGS=$(echo "$TARGET" | jq -r '.args | to_entries[] | join("=")')" >> ${GITHUB_ENV}
+
+          echo "PLATFORM_DASHED=${PLATFORM/\//-}" >> ${GITHUB_ENV}
+
+      - name: Collect metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.IMAGE_NAME }}
+          tags: type=raw,value=build
+          flavor: suffix=-${{ env.PLATFORM_DASHED }}
+
+      - name: Build image
+        id: build-image
+        uses: redhat-actions/buildah-build@v2
+        with:
+          platforms: ${{ matrix.platform }}
+          build-args: ${{ env.BUILD_ARGS }}
+          context: ${{ fromJson(env.TARGET).context }}
+          containerfiles: ${{ fromJson(env.TARGET).dockerfile }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          layers: true
+          oci: true
+
+      - name: Copy image as OCI archive
+        run: |
+          podman save \
+            --format oci-archive \
+            -o /tmp/${{ matrix.name }}-${{ env.PLATFORM_DASHED }}-oci.tar \
+            ${{ env.IMAGE_NAME }}:build-${{ env.PLATFORM_DASHED }}
+
+      - name: Upload OCI archive
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.name }}-build-${{ env.PLATFORM_DASHED }}
+          path: /tmp/${{ matrix.name }}-${{ env.PLATFORM_DASHED }}-oci.tar
+          if-no-files-found: error
+          retention-days: 1
+
+  upload:
+    name: Upload images
+    needs: [prepare, build]
+
+    strategy:
+      matrix:
+        include: ${{ fromJSON(needs.prepare.outputs.matrix) }}
+
+    permissions:
+      contents: read
+      packages: write
+
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Download OCI archives
+        uses: actions/download-artifact@v4
+        with:
+          pattern: ${{ matrix.name }}-build-*
+          path: oci-archives
+          merge-multiple: true
+
+      - name: Transform context data
+        env:
+          TARGETS: ${{ needs.prepare.outputs.targets }}
+          PLATFORM: ${{ matrix.platform }}
+        run: |
+          TARGET=$(echo "$TARGETS" | jq -c '.["${{ matrix.name }}"]')
+          echo "TARGET=${TARGET}" >> ${GITHUB_ENV}
+
+          IMAGE_TAG=$(echo "$TARGET" | jq -r '.tags[0]')
+          echo "IMAGE_NAME=${IMAGE_TAG%:*}" >> ${GITHUB_ENV}
+          echo "IMAGE_VERSION=${IMAGE_TAG#*:}" >> ${GITHUB_ENV}
+
+      - name: Create manifest
+        run: |
+          podman manifest create ${{ env.IMAGE_NAME }}:manifest
+
+          for archive in ./oci-archives/*-oci.tar; do
+            podman manifest add ${{ env.IMAGE_NAME }}:manifest oci-archive:$archive
+          done
+
+          podman manifest inspect ${{ env.IMAGE_NAME }}:manifest
+
+      - name: Collect metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: |
+            ${{ env.IMAGE_NAME }}
+          tags: |
+            type=semver,pattern={{version}},value=${{ env.IMAGE_VERSION }}
+            type=semver,pattern={{major}}.{{minor}},value=${{ env.IMAGE_VERSION }}
+            type=semver,pattern={{major}},value=${{ env.IMAGE_VERSION }}
+            type=ref,event=branch
+            type=ref,event=pr
+          flavor: |
+            latest=${{ github.ref_name == github.event.repository.default_branch }}
+
+      - name: Add tags
+        run: |
+          # fix multi-line issue from steps.meta.outputs.tags
+          podman tag ${{ env.IMAGE_NAME }}:manifest $(echo "${{ steps.meta.outputs.tags }}" | tr '\n' ' ')
+
+      - name: Push image to GHCR
+        uses: redhat-actions/push-to-registry@v2
+        id: push
+        with:
+          tags: ${{ steps.meta.outputs.tags }}
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+
+      - name: Print image url
+        run: echo "Image pushed to ${{ steps.push.outputs.registry-paths }}"
