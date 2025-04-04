@@ -85,14 +85,17 @@ jobs:
           TARGETS: ${{ needs.prepare.outputs.targets }}
           PLATFORM: ${{ matrix.platform }}
         run: |
-          TARGET=$(echo "$TARGETS" | jq -c '.["${{ matrix.name }}"]')
+          TARGET="$(echo "$TARGETS" | jq -c '.["${{ matrix.name }}"]')"
           echo "TARGET=${TARGET}" >> ${GITHUB_ENV}
 
-          IMAGE_TAG=$(echo "$TARGET" | jq -r '.tags[0]')
+          IMAGE_TAG="$(echo "$TARGET" | jq -r '.tags[0]')"
           echo "IMAGE_NAME=${IMAGE_TAG%:*}" >> ${GITHUB_ENV}
           echo "IMAGE_VERSION=${IMAGE_TAG#*:}" >> ${GITHUB_ENV}
 
-          echo "BUILD_ARGS=$(echo "$TARGET" | jq -r '.args | to_entries[] | join("=")')" >> ${GITHUB_ENV}
+          BUILD_ARGS="$(echo "$TARGET" | jq -r '.args | to_entries[] | join("=")')"
+          echo "BUILD_ARGS<<EOF" >> ${GITHUB_ENV}
+          echo "$BUILD_ARGS" >> ${GITHUB_ENV}
+          echo "EOF" >> ${GITHUB_ENV}
 
           echo "PLATFORM_DASHED=${PLATFORM/\//-}" >> ${GITHUB_ENV}
 
